@@ -4,7 +4,7 @@ Servicio Docker que mantiene una carpeta de **notas Markdown** idéntica a las n
 
 ## Formato de las notas
 
-Una nota con título `Cultivar el ánimo` y etiquetas `Vida cristiana` y `Ánimo` genera `Cultivar el ánimo.md`:
+Una nota con título `Cultivar el ánimo` y etiquetas `Vida cristiana` y `Ánimo` genera `Cultivar el animo.md`:
 
 ```markdown
 # Cultivar el ánimo
@@ -14,7 +14,17 @@ Una nota con título `Cultivar el ánimo` y etiquetas `Vida cristiana` y `Ánimo
 El contenido de la nota de JW Library.
 ```
 
-Las etiquetas aparecen después del H1 y antes del contenido. Los espacios de las etiquetas se convierten en guiones bajos. El H1 conserva el título completo; los caracteres incompatibles con un nombre de archivo se sustituyen y los nombres largos se recortan. Los títulos duplicados reciben sufijos `(2)`, `(3)`, etc. Las notas sin título usan `Sin título`.
+Las etiquetas aparecen después del H1 y antes del contenido. Los espacios de las etiquetas se convierten en guiones bajos. El H1 y el cuerpo conservan sus tildes y caracteres originales.
+
+Los nombres de archivo se normalizan a ASCII sin tildes (`á` → `a`, `ñ` → `n`). Se eliminan signos iniciales como comas, asteriscos o puntos; la puntuación restante se convierte en espacios. Solo se conservan letras, números, espacios, `_` y `-`. Se protegen los nombres reservados de Windows (`CON` → `Nota CON`) y los nombres largos se recortan. Las notas sin título usan `Sin titulo.md`.
+
+### Duplicados y nombres estables
+
+Cuando varios títulos generan el mismo nombre, también por diferencias de tildes o mayúsculas, reciben `(1)`, `(2)`, etc. El GUID de JW Library identifica la nota, independientemente de su `NoteId`, del contenido o del orden de los registros.
+
+En la primera exportación se ordenan los GUID para asignar los números. Después, cada nota nueva recibe el siguiente número disponible: nunca se reordenan ni reutilizan números históricos. Borrar la nota `(1)` no convierte la `(2)` en `(1)`, y restaurar el mismo GUID recupera su número. Si una nota inicialmente única recibe un duplicado, pasa de `Titulo.md` a `Titulo (1).md` una vez; las posteriores conservan su número.
+
+Las asignaciones se guardan en `/state/filenames.json`, fuera de la carpeta que se reemplaza. Se reservan antes de publicar para conservarlas incluso después de un fallo. Conserva el volumen de estado entre actualizaciones: eliminarlo reinicia la asignación. La primera ejecución de esta versión normaliza los nombres anteriores y crea el registro de GUID.
 
 ## Comportamiento
 

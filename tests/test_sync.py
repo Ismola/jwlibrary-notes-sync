@@ -134,7 +134,75 @@ class SyncTests(unittest.TestCase):
         matching = [path for path in paths if text.encode() in path.read_bytes()]
         self.assertEqual(len(matching), 1)
         self.assertTrue(matching[0].read_bytes().startswith("# ../Título: prueba\n\n".encode()))
-        self.assertTrue((self.output / "Sin título.md").exists())
+        self.assertTrue((self.output / "Sin titulo.md").exists())
+
+    def test_filename_normalization_is_portable_and_preserves_h1(self):
+        notes = [(1,"a",", *¿Qué dice Jehová? / \"Ánimo\".","first"),
+                 (2,"b","CON","second"), (3,"c","... AUX. ","third"),
+                 (4,"d","COM¹","fourth"), (5,"e","___--Núñez--___","fifth")]
+        backup(self.source / "backup.jwlibrary", notes=notes)
+        self.assertTrue(self.start().cycle())
+        self.assertEqual({path.name for path in self.output.iterdir()},
+                         {"Que dice Jehova Animo.md","Nota CON.md","Nota AUX.md","Nota COM1.md","Nunez.md"})
+        self.assertTrue((self.output / "Que dice Jehova Animo.md").read_text().startswith(
+            '# , *¿Qué dice Jehová? / "Ánimo".\n\n'))
+
+    def test_duplicates_keep_numbers_across_insert_delete_restore_and_restart(self):
+        path = self.source / "backup.jwlibrary"
+        backup(path, notes=[(10,"b","Dios es amor","original b"),(20,"c","Dios es amor","original c")])
+        self.assertTrue(self.start().cycle())
+        self.assertIn("original b", (self.output / "Dios es amor (1).md").read_text())
+        self.assertIn("original c", (self.output / "Dios es amor (2).md").read_text())
+        # IDs locales distintos y GUID nuevo anterior en orden alfabético.
+        backup(path, notes=[(9,"a","Dios es amor","new a"),(8,"b","Dios es amor","updated b"),
+                            (7,"c","Dios es amor","updated c")],created="2026-01-03T12:00:00Z")
+        self.assertTrue(self.start().cycle())
+        self.assertIn("updated b", (self.output / "Dios es amor (1).md").read_text())
+        self.assertIn("updated c", (self.output / "Dios es amor (2).md").read_text())
+        self.assertIn("new a", (self.output / "Dios es amor (3).md").read_text())
+        backup(path, notes=[(5,"c","Dios es amor","only c")],created="2026-01-04T12:00:00Z")
+        self.assertTrue(self.instance.cycle())
+        self.assertEqual({path.name for path in self.output.iterdir()}, {"Dios es amor (2).md"})
+        backup(path, notes=[(3,"b","Dios es amor","restored b"),(2,"c","Dios es amor","kept c"),
+                            (1,"d","Dios es amor","new d")],created="2026-01-05T12:00:00Z")
+        self.assertTrue(self.start().cycle())
+        self.assertIn("restored b", (self.output / "Dios es amor (1).md").read_text())
+        self.assertIn("kept c", (self.output / "Dios es amor (2).md").read_text())
+        self.assertIn("new d", (self.output / "Dios es amor (4).md").read_text())
+        self.assertFalse((self.output / "Dios es amor (3).md").exists())
+
+    def test_normalization_collisions_and_numeric_titles_do_not_overwrite_notes(self):
+        notes=[(1,"a","Éxito","a"),(2,"b","Exito","b"),(3,"c","¿Éxito?","c"),
+               (4,"d","Exito (1)","d")]
+        backup(self.source / "backup.jwlibrary", notes=notes)
+        self.assertTrue(self.start().cycle())
+        self.assertEqual({path.name for path in self.output.iterdir()},
+                         {"Exito (1).md","Exito (2).md","Exito (3).md","Exito 1.md"})
+
+    def test_adding_first_duplicate_keeps_original_first_and_never_reuses_numbers(self):
+        path=self.source / "backup.jwlibrary"
+        backup(path, notes=[(1,"z","Título","original")])
+        self.assertTrue(self.start().cycle())
+        self.assertTrue((self.output / "Titulo.md").exists())
+        backup(path, notes=[(2,"a","Título","new"),(9,"z","Título","original")],
+               created="2026-01-03T12:00:00Z")
+        self.assertTrue(self.instance.cycle())
+        self.assertIn("original", (self.output / "Titulo (1).md").read_text())
+        self.assertIn("new", (self.output / "Titulo (2).md").read_text())
+
+    def test_reserved_names_survive_failed_publish_and_are_not_reassigned(self):
+        path=self.source / "backup.jwlibrary"
+        backup(path, notes=[(1,"b","Título","b"),(2,"c","Título","c")])
+        instance=self.start()
+        with patch("sync.replace_output",side_effect=OSError("publish failed")):
+            with self.assertRaises(OSError):
+                instance.cycle()
+        backup(path, notes=[(3,"a","Título","a"),(4,"b","Título","b"),(5,"c","Título","c")],
+               created="2026-01-03T12:00:00Z")
+        self.assertTrue(self.start().cycle())
+        self.assertIn("b", (self.output / "Titulo (1).md").read_text())
+        self.assertIn("c", (self.output / "Titulo (2).md").read_text())
+        self.assertIn("a", (self.output / "Titulo (3).md").read_text())
 
     def test_uploaded_backup_must_stop_changing(self):
         path = self.source / "backup.jwlibrary"

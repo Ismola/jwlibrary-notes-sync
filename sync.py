@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time
 import zipfile
+import unicodedata
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -100,12 +102,67 @@ def note_title(value):
 
 
 def filename_title(title):
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", title).strip(" .") or "Sin título"
-    # Límite por bytes para sistemas de archivos con nombres UTF-8 de hasta 255 bytes.
-    value = value.encode("utf-8")[:180].decode("utf-8", errors="ignore").rstrip(" .")
-    if value.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
-        value = "_" + value
-    return value or "Sin título"
+    value = unicodedata.normalize("NFKD", title)
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    # ASCII, sin puntuación inicial, extensiones aparentes ni caracteres reservados.
+    value = re.sub(r"[^A-Za-z0-9 _-]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" _-") or "Sin titulo"
+    if value.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        value = "Nota " + value
+    return value[:180].rstrip(" _-") or "Sin titulo"
+
+
+def empty_names():
+    return {"version": 1, "families": {}}
+
+
+def validate_names(registry):
+    if registry.get("version") != 1 or not isinstance(registry.get("families"), dict):
+        raise ValueError("Registro de nombres no válido")
+    for family, data in registry["families"].items():
+        if not isinstance(data.get("numbered"), bool) or not isinstance(data.get("assignments"), dict):
+            raise ValueError("Familia de nombres no válida")
+        numbers = set()
+        for identity, assignment in data["assignments"].items():
+            number, base = assignment["number"], assignment["base"]
+            if (not identity or type(number) is not int or number < 1 or number in numbers
+                    or filename_title(base) != base or base.casefold() != family):
+                raise ValueError("Asignación de nombre no válida")
+            numbers.add(number)
+        if len(numbers) > 1 and not data["numbered"]:
+            raise ValueError("Una familia con varios identificadores debe estar numerada")
+
+
+def assign_names(notes, registry):
+    validate_names(registry)
+    groups = {}
+    identities = set()
+    for note in notes:
+        guid = note["Guid"]
+        if not isinstance(guid, str) or not guid.strip():
+            raise ValueError("Cada nota debe tener un GUID para mantener su nombre estable")
+        identity = guid.strip().casefold()
+        if identity in identities:
+            raise ValueError("La copia contiene GUID de notas duplicados")
+        identities.add(identity)
+        base = filename_title(note_title(note["Title"]))
+        groups.setdefault(base.casefold(), []).append((identity, base))
+    names = {}
+    for family, items in groups.items():
+        data = registry["families"].setdefault(family, {"numbered": False, "assignments": {}})
+        assignments = data["assignments"]
+        # GUID fija el orden inicial; las altas posteriores reciben el siguiente número.
+        next_number = max((entry["number"] for entry in assignments.values()), default=0) + 1
+        for identity, base in sorted(items):
+            if identity not in assignments:
+                assignments[identity] = {"number": next_number, "base": base}
+                next_number += 1
+        data["numbered"] = data["numbered"] or len(assignments) > 1
+        for identity, _ in items:
+            assignment = assignments[identity]
+            suffix = f" ({assignment['number']})" if data["numbered"] else ""
+            names[identity] = assignment["base"] + suffix + ".md"
+    return names
 
 
 def hashtag(value):
@@ -115,7 +172,7 @@ def hashtag(value):
     return "#" + value if value else None
 
 
-def extract_notes(snapshot, staging, temporary):
+def extract_notes(snapshot, staging, temporary, registry):
     with zipfile.ZipFile(snapshot) as archive:
         bad_entry = archive.testzip()
         if bad_entry:
@@ -135,6 +192,7 @@ def extract_notes(snapshot, staging, temporary):
         if "Note" not in tables:
             raise ValueError("No existe la tabla Note")
         notes = [dict(row) for row in connection.execute("SELECT * FROM Note ORDER BY Guid, NoteId")]
+        names = assign_names(notes, registry)
         tags = {}
         if {"Tag", "TagMap"}.issubset(tables):
             for row in connection.execute("SELECT m.NoteId, t.Name FROM TagMap m JOIN Tag t ON t.TagId=m.TagId "
@@ -143,16 +201,9 @@ def extract_notes(snapshot, staging, temporary):
                 if tag and tag not in tags.setdefault(row["NoteId"], []):
                     tags[row["NoteId"]].append(tag)
         staging.mkdir()
-        used = set()
         for note in notes:
             title = note_title(note["Title"])
-            base = filename_title(title)
-            name = base + ".md"
-            number = 2
-            while name.casefold() in used:
-                name = f"{base} ({number}).md"
-                number += 1
-            used.add(name.casefold())
+            name = names[note["Guid"].strip().casefold()]
             text = f"# {title}\n\n"
             if tags.get(note["NoteId"]):
                 text += " ".join(tags[note["NoteId"]]) + "\n\n"
@@ -255,6 +306,9 @@ class Synchronizer:
         self.first_run = True
         path = self.state / "last-sync.json"
         self.last = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        path = self.state / "filenames.json"
+        self.names = json.loads(path.read_text(encoding="utf-8")) if path.exists() else empty_names()
+        validate_names(self.names)
 
     def close(self):
         self.lock.close()
@@ -278,8 +332,12 @@ class Synchronizer:
                     and tree_digest(self.output) == self.last["files"]):
                 return False
             staging = temporary / "notes"
-            count = extract_notes(snapshot, staging, temporary)
+            registry = deepcopy(self.names)
+            count = extract_notes(snapshot, staging, temporary, registry)
             files = tree_digest(staging)
+            # Reserva los números antes de publicar, también frente a fallos o reinicios.
+            write_json(self.state / "filenames.json", registry)
+            self.names = registry
             replace_output(staging, self.output, self.state)
             self.last = {"created": candidate.created.isoformat(), "backup_sha256": backup_hash,
                          "exported_at": datetime.now(timezone.utc).isoformat(), "notes": count,
